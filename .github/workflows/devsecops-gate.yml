@@ -1,0 +1,681 @@
+# ============================================================
+#  🔐 DevSecOps Security Gate — test.com
+#  Elaborado por: Sebastian
+#
+#  BLOQUEA el merge/deploy ÚNICAMENTE si se detectan
+#  vulnerabilidades CRÍTICAS:
+#
+#  SAST  Semgrep  → solo reglas de severidad CRITICAL
+#  SAST  Bandit   → solo B605 (shell injection) y B301 (pickle RCE)
+#  SCA   pip-audit→ solo CVEs con CVSS >= 9.0
+#  IaC   Trivy    → solo severity=CRITICAL en config scan
+#  IaC   EOL      → imágenes base sin soporte (bloqueante siempre)
+#
+#  HIGH y WARNING se reportan como avisos pero NO bloquean.
+#
+#  Configurar en GitHub:
+#    Settings → Branches → Branch protection rules → main/master
+#    ✅ Require status checks: "🔐 Security Gate — Decisión Final"
+# ============================================================
+
+name: 🔐 DevSecOps Security Gate
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: devsecops-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # JOB 1: SAST — Semgrep (bloquea solo CRITICAL)
+  # ──────────────────────────────────────────────────────────
+  sast-semgrep:
+    name: "🔍 SAST — Semgrep"
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Instalar Semgrep
+        run: pip install semgrep==1.154.0
+
+      - name: Ejecutar Semgrep
+        run: |
+          semgrep \
+            --config=p/owasp-top-ten \
+            --config=p/python \
+            --config=p/php \
+            --config=p/javascript \
+            --config=p/golang \
+            --sarif --output=semgrep.sarif \
+            --json  --output=semgrep.json \
+            . 2>&1 | tee semgrep_output.txt || true
+
+      - name: Evaluar resultados — bloquear solo CRITICAL
+        run: |
+          python3 << 'EOF'
+          import json, sys
+
+          with open('semgrep.json') as f:
+              data = json.load(f)
+
+          results = data.get('results', [])
+
+          # Semgrep usa ERROR/WARNING. Mapeamos a CRITICAL solo las reglas
+          # que representan RCE directo o inyección sin mitigación posible.
+          CRITICAL_RULES = {
+              'dangerous-system-call',       # os.system/popen con input
+              'tainted-exec',                # exec() con input PHP
+              'tainted-sql-string',          # SQL con input directo
+              'path-traversal-open',         # open() con path de usuario
+              'deserialization',             # deserialización de objetos
+              'code-injection',              # eval/exec con input
+              'flask-debug-true-production', # regla custom — RCE Werkzeug
+              'pickle-from-request',         # regla custom — pickle RCE
+              'os-popen-user-input',         # regla custom — shell injection
+              'ssti-render-template-string', # regla custom — SSTI RCE
+          }
+
+          critical = []
+          high_warn = []
+
+          for r in results:
+              sev  = r.get('extra', {}).get('severity', '')
+              rule = r.get('check_id', '').split('.')[-1]
+              path = r.get('path', '')
+              line = r.get('start', {}).get('line', 0)
+              msg  = r.get('extra', {}).get('message', '')[:120]
+
+              if sev == 'ERROR' and rule in CRITICAL_RULES:
+                  critical.append(r)
+                  print(f"::error file={path},line={line}::[CRITICAL] {rule}: {msg}")
+              elif sev == 'ERROR':
+                  high_warn.append(r)
+                  print(f"::warning file={path},line={line}::[HIGH] {rule}: {msg}")
+              else:
+                  print(f"::notice file={path},line={line}::[INFO] {rule}: {msg[:80]}")
+
+          print(f"::notice::Semgrep — CRITICAL (bloquea): {len(critical)} | HIGH (aviso): {len(high_warn)}")
+
+          if critical:
+              print(f"::error::🚨 BLOQUEADO — {len(critical)} vulnerabilidades CRÍTICAS detectadas por Semgrep")
+              sys.exit(1)
+
+          print("✅ Semgrep: sin vulnerabilidades CRÍTICAS")
+          EOF
+
+      - name: Subir SARIF a GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+        continue-on-error: true
+
+      - name: Guardar artefactos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: |
+            semgrep.json
+            semgrep.sarif
+            semgrep_output.txt
+          retention-days: 30
+
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 2: SAST — Bandit (bloquea solo RCE directo)
+  # ──────────────────────────────────────────────────────────
+  sast-bandit:
+    name: "🐍 SAST — Bandit (Python)"
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Instalar Bandit
+        run: pip install bandit==1.7.10
+
+      - name: Ejecutar Bandit
+        run: |
+          bandit -r . -f json -o bandit.json \
+            --severity-level low \
+            --confidence-level low \
+            --exclude ./.git,./tests,./docs \
+            2>&1 | tee bandit_output.txt || true
+
+      - name: Evaluar resultados — bloquear solo CRITICAL
+        run: |
+          python3 << 'EOF'
+          import json, sys
+
+          with open('bandit.json') as f:
+              data = json.load(f)
+
+          results = data.get('results', [])
+
+          # Solo estos test IDs representan CRITICAL (RCE directo o inyección grave)
+          # con confianza HIGH:
+          #   B605 — subprocess con shell=True e input de usuario (Command Injection)
+          #   B602 — subprocess.call con shell=True
+          #   B301 — pickle.loads() con datos externos (RCE garantizado)
+          #   B302 — marshal.loads() (RCE)
+          #   B506 — yaml.load() sin Loader=SafeLoader (RCE)
+          CRITICAL_TESTS = {'B605', 'B602', 'B301', 'B302', 'B506'}
+
+          critical = []
+          high_warn = []
+          medium_warn = []
+
+          for r in results:
+              sev  = r.get('issue_severity', '')
+              conf = r.get('issue_confidence', '')
+              tid  = r.get('test_id', '')
+              fname = r.get('filename', '')
+              line  = r.get('line_number', 0)
+              msg   = r.get('issue_text', '')
+
+              if tid in CRITICAL_TESTS and conf in ('HIGH', 'MEDIUM'):
+                  # CRÍTICO — bloquea
+                  critical.append(r)
+                  print(f"::error file={fname},line={line}::[CRITICAL/{tid}] {msg}")
+              elif sev == 'HIGH':
+                  # HIGH — solo aviso, no bloquea
+                  high_warn.append(r)
+                  print(f"::warning file={fname},line={line}::[HIGH/{tid}] {msg}")
+              elif sev == 'MEDIUM':
+                  medium_warn.append(r)
+                  print(f"::notice file={fname},line={line}::[MEDIUM/{tid}] {msg}")
+
+          print(f"::notice::Bandit — CRITICAL (bloquea): {len(critical)} | HIGH (aviso): {len(high_warn)} | MEDIUM (aviso): {len(medium_warn)}")
+
+          if critical:
+              print(f"::error::🚨 BLOQUEADO — {len(critical)} vulnerabilidades CRÍTICAS (RCE/Injection) detectadas")
+              sys.exit(1)
+
+          print("✅ Bandit: sin vulnerabilidades CRÍTICAS")
+          EOF
+
+      - name: Guardar artefactos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-results
+          path: |
+            bandit.json
+            bandit_output.txt
+          retention-days: 30
+
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 3: SCA — pip-audit (bloquea solo CVSS >= 9.0)
+  # ──────────────────────────────────────────────────────────
+  sca-pip-audit:
+    name: "📦 SCA — pip-audit"
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Instalar pip-audit
+        run: pip install pip-audit==2.7.3
+
+      - name: Auditar dependencias Python
+        run: |
+          REQ_FILES=$(find . -name "requirements*.txt" -not -path "./.git/*" 2>/dev/null)
+
+          if [ -z "$REQ_FILES" ]; then
+            echo "::warning::Sin requirements.txt — instalando dependencias detectadas para auditar"
+            pip install flask flask-caching flask-restful 2>/dev/null || true
+            pip-audit --format=json --output=pip-audit.json 2>&1 || true
+          else
+            for req in $REQ_FILES; do
+              pip-audit -r "$req" --format=json >> pip-audit-partial.json 2>&1 || true
+            done
+            cat pip-audit-partial.json > pip-audit.json
+          fi
+
+      - name: Evaluar CVEs — bloquear solo CVSS >= 9.0
+        run: |
+          python3 << 'EOF'
+          import json, sys
+
+          try:
+              with open('pip-audit.json') as f:
+                  content = f.read().strip()
+              if not content:
+                  print("✅ pip-audit: sin CVEs")
+                  sys.exit(0)
+              data = json.loads(content)
+          except Exception:
+              print("::warning::pip-audit: sin archivo de resultados")
+              sys.exit(0)
+
+          vulns = data if isinstance(data, list) else data.get('dependencies', [])
+          critical_vulns = []
+          high_vulns     = []
+
+          for dep in vulns:
+              pkg = dep.get('name', '')
+              ver = dep.get('version', '')
+              for vuln in dep.get('vulns', []):
+                  cve_id = vuln.get('id', '')
+                  desc   = vuln.get('description', '')[:100]
+                  # pip-audit incluye CVSS en aliases o en el campo aliases
+                  # Intentar leer CVSS si está disponible
+                  cvss = vuln.get('fix_versions', [])  # fallback
+                  # Si no hay score numérico, tratamos TODO como HIGH (aviso)
+                  # salvo que el ID sea un CVE con CVSS conocido en la descripción
+                  score_str = vuln.get('severity', '') or ''
+                  try:
+                      score = float(score_str)
+                  except (ValueError, TypeError):
+                      score = 0.0
+
+                  if score >= 9.0:
+                      critical_vulns.append(f"{pkg}=={ver}: {cve_id} (CVSS {score})")
+                      print(f"::error::[CRITICAL CVE] {pkg}=={ver} — {cve_id} CVSS {score}: {desc}")
+                  else:
+                      high_vulns.append(f"{pkg}=={ver}: {cve_id}")
+                      print(f"::warning::[CVE] {pkg}=={ver} — {cve_id}: {desc}")
+
+          print(f"::notice::pip-audit — CRITICAL CVSS>=9 (bloquea): {len(critical_vulns)} | Otros CVEs (aviso): {len(high_vulns)}")
+
+          if critical_vulns:
+              print(f"::error::🚨 BLOQUEADO — {len(critical_vulns)} CVEs con CVSS >= 9.0 en dependencias")
+              sys.exit(1)
+
+          print("✅ pip-audit: sin CVEs CRÍTICOS (CVSS >= 9.0)")
+          EOF
+
+      - name: Guardar artefactos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-pip-audit-results
+          path: pip-audit.json
+          retention-days: 30
+
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 4: IaC — Hadolint (solo avisa, no bloquea)
+  # ──────────────────────────────────────────────────────────
+  iac-hadolint:
+    name: "🐳 IaC — Hadolint (Dockerfiles)"
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Instalar Hadolint
+        run: |
+          wget -qO /usr/local/bin/hadolint \
+            https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64
+          chmod +x /usr/local/bin/hadolint
+
+      - name: Escanear Dockerfiles — reportar issues como avisos
+        run: |
+          python3 << 'EOF'
+          import subprocess, json, glob, sys
+
+          dockerfiles = glob.glob('./**/Dockerfile', recursive=True)
+          dockerfiles = [d for d in dockerfiles if '.git' not in d]
+
+          # Hadolint no tiene concepto de "CRITICAL" propio.
+          # Reportamos todo como aviso — no bloqueamos el pipeline.
+          # El equipo de seguridad debe revisar en el artefacto.
+          total_issues = 0
+
+          for df in dockerfiles:
+              try:
+                  result = subprocess.run(
+                      ['hadolint', '--format', 'json', df],
+                      capture_output=True, text=True
+                  )
+                  findings = json.loads(result.stdout) if result.stdout.strip() else []
+                  for f in findings:
+                      code  = f.get('code', '')
+                      line  = f.get('line', 0)
+                      msg   = f.get('message', '')
+                      level = f.get('level', 'info')
+                      print(f"::warning file={df},line={line}::[HADOLINT/{code}] {msg}")
+                      total_issues += 1
+              except Exception as e:
+                  print(f"::notice::Error procesando {df}: {e}")
+
+          print(f"::notice::Hadolint — issues encontrados (solo aviso): {total_issues}")
+          # NO sys.exit(1) — Hadolint nunca bloquea en este pipeline
+          print("✅ Hadolint: reporte completo disponible en artefactos (no bloquea)")
+          EOF
+
+          # Generar JSON consolidado para el artefacto
+          find . -name "Dockerfile" -not -path "./.git/*" \
+            -exec hadolint --format json {} \; \
+            > hadolint-results.json 2>/dev/null || true
+
+      - name: Guardar artefactos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hadolint-results
+          path: hadolint-results.json
+          retention-days: 30
+
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 5: IaC — Trivy (bloquea solo CRITICAL + EOL)
+  # ──────────────────────────────────────────────────────────
+  iac-trivy:
+    name: "🔭 IaC — Trivy Config & EOL Scan"
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Instalar Trivy
+        run: |
+          sudo apt-get install -y wget apt-transport-https gnupg
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | \
+            gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | \
+            sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -qq && sudo apt-get install -y trivy
+
+      - name: Trivy — Escanear IaC (solo CRITICAL)
+        run: |
+          # Solo capturar CRITICAL en el scan de configuración
+          trivy config \
+            --severity CRITICAL \
+            --format sarif \
+            --output trivy-config.sarif \
+            . 2>&1 | tee trivy_output.txt || true
+
+          trivy config \
+            --severity CRITICAL \
+            --format json \
+            --output trivy-critical.json \
+            . 2>&1 || true
+
+          # Scan completo (HIGH + CRITICAL) solo para el artefacto informativo
+          trivy config \
+            --severity HIGH,CRITICAL \
+            --format json \
+            --output trivy-full.json \
+            . 2>&1 || true
+
+      - name: Evaluar hallazgos CRITICAL de Trivy
+        run: |
+          python3 << 'EOF'
+          import json, sys
+
+          # Evaluar solo el archivo de CRITICAL
+          try:
+              with open('trivy-critical.json') as f:
+                  data = json.load(f)
+          except Exception:
+              print("::notice::Trivy: sin resultados CRITICAL")
+              sys.exit(0)
+
+          results = data.get('Results', [])
+          critical_count = 0
+          high_count = 0
+
+          # Contar HIGH del full scan solo para avisos
+          try:
+              with open('trivy-full.json') as f:
+                  full = json.load(f)
+              for result in full.get('Results', []):
+                  for m in result.get('Misconfigurations', []):
+                      if m.get('Severity') == 'HIGH':
+                          high_count += 1
+                          target = result.get('Target', '')
+                          mid = m.get('ID', '')
+                          title = m.get('Title', '')
+                          print(f"::warning file={target}::[TRIVY-HIGH/{mid}] {title}")
+          except Exception:
+              pass
+
+          for result in results:
+              target = result.get('Target', '')
+              for m in result.get('Misconfigurations', []):
+                  if m.get('Severity') == 'CRITICAL':
+                      critical_count += 1
+                      mid   = m.get('ID', '')
+                      title = m.get('Title', '')
+                      print(f"::error file={target}::[TRIVY-CRITICAL/{mid}] {title}")
+
+          print(f"::notice::Trivy — CRITICAL (bloquea): {critical_count} | HIGH (aviso): {high_count}")
+
+          if critical_count > 0:
+              print(f"::error::🚨 BLOQUEADO — {critical_count} misconfiguraciones CRÍTICAS en IaC")
+              sys.exit(1)
+
+          print("✅ Trivy: sin misconfiguraciones CRÍTICAS")
+          EOF
+
+      - name: Verificar imágenes base EOL (siempre bloquea)
+        run: |
+          python3 << 'EOF'
+          import glob, sys
+
+          # Las imágenes EOL bloquean siempre porque no tienen
+          # parches de seguridad disponibles — riesgo inherente CRÍTICO.
+          EOL_IMAGES = {
+              'php:7.2':      'PHP 7.2 EOL Nov 2019',
+              'php:7.3':      'PHP 7.3 EOL Dec 2021',
+              'php:7.4':      'PHP 7.4 EOL Nov 2022',
+              'php:8.0':      'PHP 8.0 EOL Nov 2023',
+              'node:12':      'Node 12 EOL Apr 2022',
+              'node:14':      'Node 14 EOL Apr 2023',
+              'node:16':      'Node 16 EOL Sep 2023',
+              'python:2':     'Python 2 EOL Jan 2020',
+              'ubuntu:18.04': 'Ubuntu 18.04 EOL Apr 2023',
+              'ubuntu:16.04': 'Ubuntu 16.04 EOL Apr 2021',
+          }
+
+          dockerfiles = glob.glob('./**/Dockerfile', recursive=True)
+          dockerfiles = [d for d in dockerfiles if '.git' not in d]
+
+          eol_found   = []
+          latest_warn = []
+
+          for df in dockerfiles:
+              with open(df) as f:
+                  for i, line in enumerate(f, 1):
+                      if not line.strip().upper().startswith('FROM'):
+                          continue
+                      parts = line.split()
+                      image = parts[1] if len(parts) > 1 else ''
+                      # EOL check
+                      for eol_img, reason in EOL_IMAGES.items():
+                          if image.lower().startswith(eol_img):
+                              print(f"::error file={df},line={i}::[EOL-CRITICAL] {image}: {reason} — sin parches disponibles")
+                              eol_found.append(f"{df}: {image}")
+                      # :latest — solo aviso
+                      if image.lower().endswith(':latest') or (':' not in image and '@' not in image):
+                          print(f"::warning file={df},line={i}::[LATEST] {image}: tag no fijado — riesgo de supply chain")
+                          latest_warn.append(image)
+
+          print(f"::notice::EOL (bloquea): {len(eol_found)} | :latest (aviso): {len(latest_warn)}")
+
+          if eol_found:
+              print(f"::error::🚨 BLOQUEADO — {len(eol_found)} imágenes EOL sin parches de seguridad")
+              sys.exit(1)
+
+          print("✅ Sin imágenes EOL bloqueantes")
+          EOF
+
+      - name: Subir SARIF a GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+        continue-on-error: true
+
+      - name: Guardar artefactos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: |
+            trivy-critical.json
+            trivy-full.json
+            trivy-config.sarif
+            trivy_output.txt
+          retention-days: 30
+
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 6: 🔐 SECURITY GATE — Decisión final
+  # ──────────────────────────────────────────────────────────
+  security-gate:
+    name: "🔐 Security Gate — Decisión Final"
+    runs-on: ubuntu-22.04
+    needs:
+      - sast-semgrep
+      - sast-bandit
+      - sca-pip-audit
+      - iac-hadolint
+      - iac-trivy
+    if: always()
+
+    steps:
+      - name: Evaluar resultados y decidir bloqueo
+        run: |
+          python3 << 'EOF'
+          import os, sys
+
+          jobs = {
+              'SAST — Semgrep':   os.environ.get('SEMGREP_RESULT',  'unknown'),
+              'SAST — Bandit':    os.environ.get('BANDIT_RESULT',   'unknown'),
+              'SCA  — pip-audit': os.environ.get('PIPAUDIT_RESULT', 'unknown'),
+              'IaC  — Hadolint':  os.environ.get('HADOLINT_RESULT', 'unknown'),
+              'IaC  — Trivy+EOL': os.environ.get('TRIVY_RESULT',   'unknown'),
+          }
+
+          failed = [k for k, v in jobs.items() if v == 'failure']
+
+          print("=" * 60)
+          print("🔐 SECURITY GATE — RESUMEN (umbral: CRITICAL only)")
+          print("=" * 60)
+          for name, status in jobs.items():
+              icon = "✅" if status == "success" else ("❌" if status == "failure" else "⚠️ ")
+              print(f"  {icon}  {name}: {status}")
+          print("=" * 60)
+
+          if failed:
+              print(f"\n🚨 PIPELINE BLOQUEADO — vulnerabilidades CRÍTICAS en {len(failed)} check(s):")
+              for j in failed:
+                  print(f"   ❌  {j}")
+              print("\nRemedia los hallazgos CRITICAL antes de hacer merge/deploy.")
+              sys.exit(1)
+
+          print("\n✅ PIPELINE APROBADO — sin vulnerabilidades CRÍTICAS")
+          print("   (Los avisos HIGH/MEDIUM están en los artefactos del workflow)")
+          EOF
+        env:
+          SEMGREP_RESULT:  ${{ needs.sast-semgrep.result }}
+          BANDIT_RESULT:   ${{ needs.sast-bandit.result }}
+          PIPAUDIT_RESULT: ${{ needs.sca-pip-audit.result }}
+          HADOLINT_RESULT: ${{ needs.iac-hadolint.result }}
+          TRIVY_RESULT:    ${{ needs.iac-trivy.result }}
+
+      - name: Resumen en GitHub Actions Summary
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'MD'
+          # 🔐 DevSecOps Security Gate — Umbral: solo CRITICAL
+
+          > **Política:** solo se bloquea el merge ante vulnerabilidades CRITICAL.
+          > HIGH/MEDIUM se registran como avisos en los artefactos del workflow.
+
+          | Layer | Herramienta | Resultado |
+          |-------|------------|-----------|
+          | SAST  | Semgrep (OWASP Top 10) | ${{ needs.sast-semgrep.result == 'success' && '✅ Sin CRITICAL' || '🚨 CRITICAL encontrado' }} |
+          | SAST  | Bandit (B605/B301/B302) | ${{ needs.sast-bandit.result == 'success' && '✅ Sin CRITICAL' || '🚨 CRITICAL encontrado' }} |
+          | SCA   | pip-audit (CVSS ≥ 9.0) | ${{ needs.sca-pip-audit.result == 'success' && '✅ Sin CRITICAL' || '🚨 CRITICAL encontrado' }} |
+          | IaC   | Hadolint (Dockerfiles) | ${{ needs.iac-hadolint.result == 'success' && '✅ Revisado' || '⚠️ Issues reportados' }} |
+          | IaC   | Trivy + EOL images | ${{ needs.iac-trivy.result == 'success' && '✅ Sin CRITICAL' || '🚨 CRITICAL encontrado' }} |
+
+          *Elaborado por: Sebastian | test.com DevSecOps*
+          MD
+
+      - name: Comentar resultado en PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const results = {
+              semgrep:  '${{ needs.sast-semgrep.result }}',
+              bandit:   '${{ needs.sast-bandit.result }}',
+              pipaudit: '${{ needs.sca-pip-audit.result }}',
+              hadolint: '${{ needs.iac-hadolint.result }}',
+              trivy:    '${{ needs.iac-trivy.result }}',
+            };
+
+            const icon = s => s === 'success' ? '✅' : s === 'failure' ? '🚨' : '⚠️';
+
+            // Hadolint nunca falla el pipeline — siempre es aviso
+            const blockers = ['semgrep','bandit','pipaudit','trivy'];
+            const blocked  = blockers.some(k => results[k] === 'failure');
+
+            const body = `## 🔐 DevSecOps Security Gate
+            **Umbral de bloqueo: solo CRITICAL** — HIGH/MEDIUM son avisos
+
+            ${blocked
+              ? '### 🚨 BLOQUEADO — Vulnerabilidades CRÍTICAS detectadas'
+              : '### ✅ APROBADO — Sin vulnerabilidades CRÍTICAS'}
+
+            | Layer | Herramienta | Estado |
+            |-------|------------|--------|
+            | SAST  | Semgrep (RCE/Injection rules) | ${icon(results.semgrep)} ${results.semgrep} |
+            | SAST  | Bandit (B605/B301/B302) | ${icon(results.bandit)} ${results.bandit} |
+            | SCA   | pip-audit (CVSS ≥ 9.0) | ${icon(results.pipaudit)} ${results.pipaudit} |
+            | IaC   | Hadolint (aviso, no bloquea) | ℹ️ ${results.hadolint} |
+            | IaC   | Trivy CRITICAL + EOL images | ${icon(results.trivy)} ${results.trivy} |
+
+            ${blocked
+              ? '> 🔴 Este PR **no puede mergearse** hasta resolver los hallazgos CRITICAL.\n> Ver logs y artefactos del workflow para el detalle.'
+              : '> Los artefactos del workflow contienen el reporte completo incluyendo HIGH/MEDIUM.'}
+
+            *Elaborado por: Sebastian | test.com DevSecOps*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });

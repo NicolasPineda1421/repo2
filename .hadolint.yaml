@@ -1,0 +1,46 @@
+# ============================================================
+#  Hadolint — Configuración de reglas para Dockerfiles
+#  test.com DevSecOps Pipeline
+#  Elaborado por: Sebastian
+# ============================================================
+
+# Nivel mínimo de fallo (error|warning|info|style)
+failure-threshold: warning
+
+# Ignorar solo reglas de estilo no bloqueantes para el pipeline
+ignore:
+  - DL3008  # apt-get sin versiones fijadas — warning, no bloqueante
+  - DL3009  # apt-get clean — recomendación
+  - DL3015  # apt-get --no-install-recommends — recomendación
+  - SC1091  # source file not found — falso positivo en builds
+
+# Reglas NO ignoradas (activas y bloqueantes si son ERROR):
+# DL3002 — Evitar cambiar a root con USER root
+# DL3003 — Usar WORKDIR en lugar de cd
+# DL3006 — Siempre etiquetar la versión de la imagen base
+# DL3007 — No usar :latest sin hash
+# DL3013 — Fijar versiones pip
+# DL3016 — Fijar versiones npm
+# DL3018 — Fijar versiones apk
+# DL3020 — Usar COPY en lugar de ADD para archivos locales
+# DL3025 — Usar JSON para CMD y ENTRYPOINT
+# DL4000 — MAINTAINER está obsoleto — usar LABEL
+# DL4006 — Usar set -o pipefail antes de pipes en RUN
+
+# Imagen base de confianza — solo permitir registries conocidos
+trustedRegistries:
+  - docker.io
+  - ghcr.io
+  - public.ecr.aws
+  - mcr.microsoft.com
+
+# Formato del output (tty|json|checkstyle|codeclimate|gitlab_codeclimate|gnu|codacy)
+format: tty
+
+# No hacer override de estas reglas críticas
+overrides:
+  rules:
+    - id: DL3002
+      severity: error
+    - id: DL3007
+      severity: error
